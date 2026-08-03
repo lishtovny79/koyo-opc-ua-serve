@@ -1,0 +1,16 @@
+[Unit]
+Description=Koyo OPC UA Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=koyoopc
+Group=koyoopc
+WorkingDirectory=/opt/koyo-opc-ua-server
+ExecStart=/opt/koyo-opc-ua-server/.venv/bin/koyo-opc-ua-server --config /etc/koyo-opc-ua-server/config.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

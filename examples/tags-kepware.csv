@@ -1,0 +1,4 @@
+Tag Name,Address,Data Type,Respect Data Type,Client Access,Scan Rate
+Demo.Run,"C0",Boolean,1,R/W,100
+Demo.Setpoint,"V2000",Word,1,R/W,100
+Demo.Temperature,"V2001",Float,1,R/W,100

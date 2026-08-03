@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "koyo-opc-ua-server"
+version = "0.1.0"
+description = "OPC UA server for Koyo / DirectLOGIC PLCs using Kepware CSV tag exports"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Your Name" }]
+dependencies = ["asyncua>=1.1,<2"]
+
+[project.scripts]
+koyo-opc-ua-server = "koyo_opc_ua_server.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

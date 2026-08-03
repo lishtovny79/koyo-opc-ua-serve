@@ -1,0 +1,14 @@
+services:
+  koyo-opc-ua-server:
+    build: .
+    image: koyo-opc-ua-server:local
+    container_name: koyo-opc-ua-server
+    restart: unless-stopped
+    ports:
+      - "4840:4840/tcp"
+    volumes:
+      # Create config/config.toml from config/config.example.toml first.
+      - ./config/config.toml:/app/config/config.toml:ro
+      # Persistent SQLite tag catalog and live backups.
+      - ./data:/app/data
+      - ./backups:/app/backups
