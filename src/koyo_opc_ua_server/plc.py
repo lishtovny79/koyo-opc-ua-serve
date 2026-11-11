@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import socket
-
 
 logger = logging.getLogger(__name__)
 READ_TRIGGER = bytes.fromhex("48415048582e990600201900000000")
@@ -28,6 +28,9 @@ class KoyoPLC:
         self.receive_timeout = receive_timeout
         self.sock: socket.socket | None = None
         self.lock = asyncio.Lock()
+        self._read_handle = secrets.randbits(16)
+        self._peer = (socket.gethostbyname(host), port)
+        self.rejected_packets: dict[str, int] = {}
         self._seq = 0xC2
         self.is_online = False
         self._connect_socket()
@@ -44,50 +47,102 @@ class KoyoPLC:
             self.sock.close()
             self.sock = None
 
-    async def _receive(self, expected_seq: int) -> bytes | None:
+    def _reject(self, reason: str) -> None:
+        count = self.rejected_packets.get(reason, 0) + 1
+        self.rejected_packets[reason] = count
+        if count == 1 or count % 100 == 0:
+            logger.warning("Rejected PLC UDP response: %s (count=%d)", reason, count)
+
+    async def _receive(self, handle: bytes, command: int | None,
+                       expected_length: int | None) -> bytes | None:
         if self.sock is None:
             return None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.receive_timeout
         while (remaining := deadline - loop.time()) > 0:
             try:
-                data, _ = await asyncio.wait_for(loop.sock_recvfrom(self.sock, 2048), remaining)
+                data, peer = await asyncio.wait_for(
+                    loop.sock_recvfrom(self.sock, 2048), remaining
+                )
             except asyncio.TimeoutError:
                 return None
             except OSError as exc:
                 logger.warning("UDP receive error: %s", exc)
                 return None
-            if len(data) > 3 and data[3] == expected_seq:
-                return data
+            reason = self._invalid_response(data, peer, handle, command, expected_length)
+            if reason:
+                self._reject(reason)
+                continue
+            return data
         return None
 
+    def _invalid_response(self, data: bytes, peer: tuple,
+                          handle: bytes, command: int | None, expected_length: int | None) -> str | None:
+        if peer[:2] != self._peer:
+            return "unexpected sender"
+        if len(data) < 13 or data[:3] != b"HAP":
+            return "invalid HAP header"
+        if data[3:5] != handle:
+            return "late or unrelated transaction"
+        if int.from_bytes(data[7:9], "little") != len(data) - 9:
+            return "invalid declared payload length"
+        if int.from_bytes(data[5:7], "little") != crc16_ccitt(data[9:]):
+            return "CRC mismatch"
+        if command is not None and data[9] != command:
+            return "unexpected transaction phase"
+        if command is not None and data[10:13] != bytes([0x19, 0, 0]):
+            return "PLC response status or function mismatch"
+        if expected_length is not None and len(data) != expected_length:
+            return "unexpected read block length"
+        return None
+
+    def _failed_exchange(self) -> None:
+        self.is_online = False
+        # A fresh source port prevents a timed-out response from reaching the next request.
+        self._connect_socket()
+
     async def exchange(self, setup: bytes, sequence: int, trigger: bytes | None = None) -> bytes | bool | None:
-        """Run one serialized PLC transaction; only a matching response is accepted."""
+        """Serialize exchanges and accept only an exact response to the current phase."""
         async with self.lock:
             if self.sock is None:
                 self._connect_socket()
             assert self.sock is not None
+            expected_bytes = None
+            if trigger is not None:
+                if len(setup) != 17 or setup[9:13] != bytes([0x19, 0, 1, 0x1E]):
+                    raise ValueError("Invalid read setup packet")
+                expected_bytes = setup[13]
+                if expected_bytes == 0 or expected_bytes % 2:
+                    raise ValueError("Invalid read block byte count")
+                # Templates are cached, but each actual read needs a new two-byte handle.
+                self._read_handle = (self._read_handle + 1) & 0xFFFF
+                handle = self._read_handle.to_bytes(2, "little")
+                setup = setup[:3] + handle + setup[5:]
+                trigger = trigger[:3] + handle + trigger[5:]
+            else:
+                handle = setup[3:5]
+                if not handle or setup[3] != sequence:
+                    raise ValueError("Invalid write transaction handle")
             loop = asyncio.get_running_loop()
             try:
-                await loop.sock_sendto(self.sock, setup, (self.host, self.port))
-                if await self._receive(sequence) is None:
-                    self.is_online = False
+                await loop.sock_sendto(self.sock, setup, self._peer)
+                if await self._receive(handle, 0x20 if trigger is not None else None, 15 if trigger is not None else None) is None:
+                    self._failed_exchange()
                     return None
                 if trigger is None:
                     self.is_online = True
                     return True
-                await asyncio.sleep(0.01)  # Required by the DL205 two-phase read exchange.
-                await loop.sock_sendto(self.sock, trigger, (self.host, self.port))
-                response = await self._receive(sequence)
-                if response is None or len(response) < 14 or response[9] != 0x22:
-                    self.is_online = False
+                await asyncio.sleep(0.01)
+                await loop.sock_sendto(self.sock, trigger, self._peer)
+                response = await self._receive(handle, 0x22, 13 + expected_bytes)
+                if response is None:
+                    self._failed_exchange()
                     return None
                 self.is_online = True
                 return response[13:]
             except OSError as exc:
                 logger.warning("PLC exchange error: %s", exc)
-                self.is_online = False
-                self._connect_socket()
+                self._failed_exchange()
                 return None
 
     def next_sequence(self) -> int:

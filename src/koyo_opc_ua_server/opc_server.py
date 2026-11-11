@@ -233,14 +233,23 @@ class OpcServerManager:
             self.read_requests.append((start, self.plc.make_read_packet(start, length)))
             index = end_index + 1
 
-    async def sync_plc(self) -> None:
+    async def sync_plc(self) -> bool:
+        # Publish one coherent cycle; a failed block must not partially replace the cache.
+        candidate = self.word_cache.copy()
         for start, packet in tuple(self.read_requests):
             response = await self.plc.exchange(packet, 0x48, READ_TRIGGER)
-            if not isinstance(response, bytes):
-                break
-            for offset in range(0, len(response) - 1, 2):
-                self.word_cache[start + offset // 2] = response[offset] | response[offset + 1] << 8
+            expected_bytes = packet[13]
+            if not isinstance(response, bytes) or len(response) != expected_bytes:
+                self.plc.is_online = False
+                logger.warning("PLC read cycle discarded: start=%d expected_bytes=%d received_bytes=%s",
+                               start, expected_bytes, len(response) if isinstance(response, bytes) else None)
+                await self.update_online_status()
+                return False
+            for offset in range(0, len(response), 2):
+                candidate[start + offset // 2] = response[offset] | response[offset + 1] << 8
+        self.word_cache = candidate
         await self.update_online_status()
+        return True
 
     async def update_online_status(self) -> None:
         if self.online_node is not None and self._online_value != self.plc.is_online:
@@ -275,14 +284,25 @@ class OpcServerManager:
             # updates cannot overwrite each other's bits in one PLC word.
             if not self.write_lock.locked():
                 async with self.tag_lock:
-                    await self.sync_plc()
-                    for binding in tuple(self.bindings.values()):
-                        value = binding.definition.decode(self.word_cache)
-                        if binding.last_value != value:
-                            binding.last_value = value
-                            await binding.node.write_value(
-                                ua.DataValue(ua.Variant(value, binding.ua_type))
-                            )
+                    if await self.sync_plc():
+                        for binding in tuple(self.bindings.values()):
+                            tag = binding.definition
+                            try:
+                                value = tag.decode(self.word_cache)
+                            except ValueError:
+                                logger.exception(
+                                    "PLC decode failed: tag=%s word=%s raw=%r next_word=%r",
+                                    tag.name,
+                                    tag.word,
+                                    self.word_cache.get(tag.word),
+                                    self.word_cache.get(tag.word + 1),
+                                )
+                                raise
+                            if binding.last_value != value:
+                                binding.last_value = value
+                                await binding.node.write_value(
+                                    ua.DataValue(ua.Variant(value, binding.ua_type))
+                                )
             await asyncio.sleep(self.config.poll_interval)
 
     async def run(self) -> None:
